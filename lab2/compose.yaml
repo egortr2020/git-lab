@@ -1,0 +1,25 @@
+services:
+  backend:
+    build: ./backend
+    image: lab-backend:latest
+    restart: unless-stopped
+    # порты наружу не публикуются: бэкенд доступен только во внутренней сети
+    expose:
+      - "5000"
+    networks:
+      - internal
+
+  frontend:
+    build: ./frontend
+    image: lab-frontend:latest
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+    networks:
+      - internal
+
+networks:
+  internal:
+    driver: bridge
