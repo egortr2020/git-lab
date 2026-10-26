@@ -1,6 +1,6 @@
 # Лабораторная работа: Docker Compose + KVM
 
-Двухсервисное веб-приложение (nginx + Flask), которое собирается через Docker Compose и разворачивается в виртуальной машине под управлением KVM. Работа выполнена на MacBook с Apple M4 (macOS, arm64).
+Двухсервисное веб-приложение (nginx + Flask), которое собирается через Docker Compose и разворачивается в виртуальной машине под управлением KVM. Работа выполнена на MacBook с Apple M4 (macOS 26, arm64). Уровень: **7 баллов**.
 
 ---
 
@@ -33,7 +33,7 @@
 - `frontend` зависит от `backend` через `depends_on`;
 - оба сервиса подключены к внутренней сети `internal` (bridge), и бэкенд доступен фронтенду только через неё.
 
-Образы основаны на мультиархитектурных `python:3.12-slim` и `nginx:alpine`. Платформо-зависимых бинарников нет: Flask и gunicorn написаны на чистом Python. Поэтому приложение без изменений собирается и на arm64 (Mac, app-vm), и на amd64.
+Образы основаны на мультиархитектурных `python:3.12-slim` и `nginx:alpine`. Платформо-зависимых бинарников нет, поэтому приложение без изменений собирается и на arm64 (Mac, app-vm), и на amd64.
 
 Структура (вторая лабораторная лежит в подпапке `lab2/` репозитория `git-lab`):
 
@@ -46,11 +46,10 @@ git-lab/
     │   ├── app.py
     │   ├── requirements.txt
     │   └── Dockerfile
-    ├── frontend/
-    │   ├── index.html
-    │   ├── nginx.conf
-    │   └── Dockerfile
-    └── screenshots/
+    └── frontend/
+        ├── index.html
+        ├── nginx.conf
+        └── Dockerfile
 ```
 
 Все команды `docker compose` и `scp` ниже выполняются **из каталога `lab2/`**.
@@ -64,9 +63,7 @@ git clone https://github.com/egortr2020/git-lab.git
 cd git-lab/lab2
 docker compose up -d --build
 docker compose ps
-curl http://localhost:8080
-curl http://localhost:8080/api/info
-curl http://localhost:8080/api/health
+curl localhost:8080/api/info
 docker compose down
 ```
 
@@ -81,6 +78,7 @@ lab2-frontend-1   lab-frontend:latest   "/docker-entrypoint.…"   frontend   15
 $ curl localhost:8080/api/info
 {"container":"3d23ab9de2b7","message":"Привет от backend-сервиса на Flask!","time":"2026-10-19T18:10:52.674981+00:00"}
 ```
+
 У бэкенда в колонке `PORTS` указано только `5000/tcp`, без привязки к хосту, то есть снаружи он недоступен.
 
 > На macOS порт 5000 занят AirPlay Receiver (`ControlCenter`). Поэтому `curl localhost:5000` на маке возвращает ответ `AirTunes`, а не Flask. Это ещё одна причина публиковать наружу только фронтенд.
@@ -132,124 +130,89 @@ $ curl localhost:8080/api/info
 
 KVM (Kernel-based Virtual Machine) — модуль ядра **Linux**. В macOS его нет: там используется собственный гипервизор Apple (Hypervisor.framework / Virtualization.framework). Поэтому запустить KVM прямо на маке нельзя.
 
-Решение — **вложенная виртуализация**. Начиная с Apple Silicon M3 и macOS 15 Sequoia, Virtualization.framework умеет передавать гостевой Linux-VM аппаратные расширения виртуализации ARM (EL2). Внутри такой VM ядро Linux поднимает KVM, появляется `/dev/kvm`, и в ней можно запускать собственные KVM-машины. На M4 эта возможность есть.
+Решение — **вложенная виртуализация**. На Apple Silicon M3 и новее с macOS 15 и новее Virtualization.framework умеет передавать гостевой Linux-VM аппаратные расширения виртуализации ARM. Внутри такой VM ядро Linux поднимает KVM, появляется `/dev/kvm`, и в ней можно запускать собственные KVM-машины. На M4 эта возможность есть.
 
-Lima VM «kvmhost» создаётся с `vmType: vz` (Apple Virtualization.framework) и `nestedVirtualization: true`. Она служит KVM-хостом.
+Lima VM «kvmhost» создаётся с `vmType: vz` (Apple Virtualization.framework) и `nestedVirtualization: true`. Она служит KVM-хостом. Сама kvmhost работает не на KVM, а на гипервизоре Apple, поэтому VM для приложения создаётся внутри неё, уже на KVM.
 
 ### 4.1. Диагностика на маке
 
-```bash
-sw_vers                  # версия macOS, нужна 15+
-uname -m                 # arm64
-sysctl kern.hv_support   # 1 — гипервизор поддерживается
+```
+$ sw_vers; uname -m; sysctl kern.hv_support
+ProductName:		macOS
+ProductVersion:		26.6.2
+BuildVersion:		25G83
+arm64
+kern.hv_support: 1
 ```
 
-Вывод:
-
-```
-$ sw_vers
-<вставить вывод>
-
-$ uname -m
-<вставить вывод>
-
-$ sysctl kern.hv_support
-<вставить вывод>
-```
+macOS 26 (новее 15), архитектура arm64 (Apple M4), гипервизор доступен (`kern.hv_support: 1`).
 
 ### 4.2. Создание Lima VM «kvmhost»
 
-Файл `kvmhost.yaml`:
-
-```yaml
-vmType: vz
-nestedVirtualization: true
-images:
-  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
-    arch: aarch64
-cpus: 4
-memory: 8GiB
-disk: 40GiB
-```
-
 ```bash
 brew install lima
-limactl start --name=kvmhost ./kvmhost.yaml
+limactl start --name=kvmhost --vm-type=vz \
+  --cpus=4 --memory=8 --disk=40 \
+  --set='.nestedVirtualization=true' \
+  template:ubuntu-24.04
 limactl list
 limactl shell kvmhost
+```
+
+```
+$ limactl list
+NAME       STATUS     SSH                VMTYPE    ARCH       CPUS    MEMORY    DISK     DIR
+kvmhost    Running    127.0.0.1:55668    vz        aarch64    4       8GiB      40GiB    ~/.lima/kvmhost
 ```
 
 ### 4.3. Диагностика внутри kvmhost
 
 ```bash
 ls -l /dev/kvm
-sudo apt-get install -y cpu-checker
-kvm-ok
+sudo apt update && sudo apt install -y cpu-checker && kvm-ok
 ```
-
-Вывод:
 
 ```
 $ ls -l /dev/kvm
-<вставить вывод, ожидается: crw-rw---- 1 root kvm 10, 232 ... /dev/kvm>
+crw-rw---- 1 root kvm 10, 232 Oct 20 06:39 /dev/kvm
 
 $ kvm-ok
-<вставить вывод, ожидается: INFO: /dev/kvm exists
-KVM acceleration can be used>
+INFO: /dev/kvm exists
+KVM acceleration can be used
 ```
-
-**Скриншот:** `kvm-ok` внутри kvmhost
-
-![kvm-ok](screenshots/01-kvm-ok.png)
 
 ---
 
-## 5. Создание VM в KVM
+## 5. Создание VM в KVM (вручную)
 
 Все команды выполняются **внутри kvmhost** (`limactl shell kvmhost`).
 
 ### 5.1. Установка пакетов виртуализации
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y qemu-system-arm qemu-efi-aarch64 qemu-utils \
-                        libvirt-daemon-system virtinst
-sudo usermod -aG libvirt,kvm "$USER"
-sudo systemctl enable --now libvirtd
-
-# сеть libvirt default (192.168.122.0/24, virbr0)
-sudo virsh net-start default 2>/dev/null || true
-sudo virsh net-autostart default
-sudo virsh net-list --all
+cd ~
+sudo apt install -y qemu-system-arm qemu-efi-aarch64 qemu-utils \
+                    libvirt-daemon-system virtinst cloud-image-utils
+sudo virsh net-list --all      # сеть default (192.168.122.0/24, virbr0) должна быть active
 ```
 
-### 5.2. Скачивание cloud-образа Ubuntu 24.04 arm64
+### 5.2. Скачивание cloud-образа Ubuntu 24.04 arm64 и диск VM
+
+Базовый образ не изменяется. Все изменения VM пишутся в отдельный overlay-диск `app-vm.qcow2` (backing file, 20G):
 
 ```bash
 cd /var/lib/libvirt/images
-sudo wget https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img
+sudo wget -q --show-progress https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img
+sudo qemu-img create -f qcow2 -F qcow2 -b noble-server-cloudimg-arm64.img app-vm.qcow2 20G
+cd ~
 ```
 
-### 5.3. Диск VM: qcow2 с backing file на 20G
+### 5.3. cloud-init: seed ISO с SSH-ключом
 
-Базовый образ не изменяется. Все изменения VM пишутся в отдельный overlay-диск `app-vm.qcow2`:
-
-```bash
-sudo qemu-img create -f qcow2 \
-  -F qcow2 -b /var/lib/libvirt/images/noble-server-cloudimg-arm64.img \
-  /var/lib/libvirt/images/app-vm.qcow2 20G
-
-sudo qemu-img info /var/lib/libvirt/images/app-vm.qcow2
-```
-
-### 5.4. cloud-init: user-data с SSH-ключом
-
-На маке нужен SSH-ключ (`ssh-keygen -t ed25519`, если его ещё нет). Содержимое `~/.ssh/id_ed25519.pub` вставляется в `user-data`:
+Lima монтирует домашнюю папку мака внутрь kvmhost, поэтому публичный ключ берётся прямо оттуда:
 
 ```bash
-mkdir -p ~/cloud-init && cd ~/cloud-init
-
-cat > user-data <<'EOF'
+cat > ~/user-data <<EOF
 #cloud-config
 hostname: app-vm
 users:
@@ -257,171 +220,145 @@ users:
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
     ssh_authorized_keys:
-      - ssh-ed25519 AAAA...ВАШ_ПУБЛИЧНЫЙ_КЛЮЧ... user@macbook
-ssh_pwauth: false
-package_update: true
+      - $(cat /Users/egorkorostelev/.ssh/id_ed25519.pub)
 EOF
 
-cat > meta-data <<'EOF'
-instance-id: app-vm
+cat > ~/meta-data <<'EOF'
+instance-id: app-vm-01
 local-hostname: app-vm
 EOF
+
+cat > ~/network-config <<'EOF'
+version: 2
+ethernets:
+  id0:
+    match:
+      name: "en*"
+    dhcp4: true
+EOF
+
+cloud-localds --network-config=network-config seed.iso user-data meta-data
+sudo cp seed.iso /var/lib/libvirt/images/app-vm-seed.iso
 ```
 
-### 5.5. Статический IP через DHCP-резервацию в сети default
+### 5.4. Статический IP через DHCP-резервацию в сети default
 
 ```bash
 sudo virsh net-update default add ip-dhcp-host \
-  "<host mac='52:54:00:aa:bb:01' name='app-vm' ip='192.168.122.10'/>" \
-  --live --config
-
-sudo virsh net-dumpxml default | grep -A1 "host mac"
+  "<host mac='52:54:00:aa:bb:01' name='app-vm' ip='192.168.122.10'/>" --live --config
 ```
 
-### 5.6. Создание VM через virt-install
+### 5.5. Создание VM через virt-install
 
 ```bash
 sudo virt-install \
-  --name app-vm \
-  --virt-type kvm \
-  --arch aarch64 \
-  --machine virt \
-  --boot uefi \
-  --vcpus 2 \
-  --memory 2048 \
-  --osinfo ubuntu24.04 \
+  --name app-vm --virt-type kvm \
+  --memory 2048 --vcpus 2 \
+  --arch aarch64 --machine virt --boot uefi \
   --disk path=/var/lib/libvirt/images/app-vm.qcow2,format=qcow2,bus=virtio \
+  --disk path=/var/lib/libvirt/images/app-vm-seed.iso,device=cdrom \
+  --osinfo linux2022 \
   --network network=default,model=virtio,mac=52:54:00:aa:bb:01 \
-  --cloud-init user-data="$HOME/cloud-init/user-data",meta-data="$HOME/cloud-init/meta-data" \
-  --graphics none \
-  --noautoconsole \
-  --import
+  --graphics none --import --noautoconsole
+
+sudo virsh autostart app-vm     # VM стартует вместе с kvmhost
 ```
 
-Проверка:
+> **Почему seed ISO, а не `--cloud-init`.** Первая попытка была с `virt-install --cloud-init user-data=...`. VM создалась, но сразу оказалась в состоянии `shut off`. После ручного запуска она загрузилась как `ubuntu login:` без наших настроек: virt-install подключает данные cloud-init только на первый запуск, а он прервался. Поэтому VM была пересоздана (`virsh destroy`, `virsh undefine --nvram`, новый overlay-диск), а настройки подключены постоянным CD-ROM с NoCloud seed ISO. В консоли VM (`sudo virsh console app-vm`) cloud-init подтвердил источник `Datasource DataSourceNoCloud [seed=/dev/sr0]` и добавил ключ пользователю `ubuntu`, приглашение стало `app-vm login:`.
+
+### 5.6. Проверка
 
 ```bash
 sudo virsh list --all
-sudo virsh net-dhcp-leases default
-ssh ubuntu@192.168.122.10      # проверка изнутри kvmhost
+sudo virsh dumpxml app-vm | grep "domain type"
+sudo virsh domifaddr app-vm
 ```
-
-Вывод:
 
 ```
 $ sudo virsh list --all
-<вставить вывод, ожидается:  Id   Name     State
-                             1    app-vm   running>
+ Id   Name     State
+------------------------
+ 3    app-vm   running
 
-$ sudo virsh net-dhcp-leases default
-<вставить вывод>
-```
+$ sudo virsh dumpxml app-vm | grep "domain type"
+<domain type='kvm' id='3'>
 
-**Скриншот:** `virsh list`
-
-![virsh list](screenshots/02-virsh-list.png)
-
----
-
-## 6. Подтверждение, что VM работает именно на KVM
-
-### 6.1. В kvmhost: тип домена libvirt
-
-```bash
-sudo virsh dumpxml app-vm | grep "domain type"
-```
-
-```
-<вставить вывод, ожидается: <domain type='kvm' id='1'>>
+$ sudo virsh domifaddr app-vm
+ Name       MAC address          Protocol     Address
+-------------------------------------------------------------------------------
+ vnet2      52:54:00:aa:bb:01    ipv4         192.168.122.10/24
 ```
 
 `type='kvm'` означает аппаратное ускорение через `/dev/kvm`. При программной эмуляции QEMU TCG здесь было бы `type='qemu'`.
 
-**Скриншот:** `domain type='kvm'`
-
-![domain type kvm](screenshots/03-domain-type-kvm.png)
-
-### 6.2. Внутри app-vm
-
-```bash
-ssh app-vm
-systemd-detect-virt
-```
-
-```
-<вставить вывод, ожидается: kvm>
-```
-
-**Скриншот:** `systemd-detect-virt`
-
-![systemd-detect-virt](screenshots/04-systemd-detect-virt.png)
-
 ---
 
-## 7. Деплой приложения в VM и проброс порта
+## 6. SSH-доступ к app-vm с ноутбука и проверка KVM изнутри
 
-### 7.1. SSH-доступ к app-vm с ноутбука
+app-vm находится в изолированной сети libvirt, поэтому подключение к ней идёт через kvmhost (`ProxyJump`). Lima генерирует SSH-конфиг для kvmhost (хост `lima-kvmhost`).
 
-Lima генерирует SSH-конфиг для kvmhost (хост `lima-kvmhost`). app-vm находится в изолированной сети libvirt, поэтому подключение к ней идёт через kvmhost (`ProxyJump`).
-
-`~/.ssh/config` на маке (строка `Include` должна стоять **в начале** файла, до любых блоков `Host`):
+`~/.ssh/config` на маке (строка `Include` стоит **в начале** файла, до любых блоков `Host`):
 
 ```
 Include ~/.lima/kvmhost/ssh.config
 
 Host app-vm
-    HostName 192.168.122.10
-    User ubuntu
-    IdentityFile ~/.ssh/id_ed25519
-    ProxyJump lima-kvmhost
+  HostName 192.168.122.10
+  User ubuntu
+  ProxyJump lima-kvmhost
 ```
 
-Проверка:
+Проверка с мака:
+
+```
+$ ssh app-vm 'hostname; systemd-detect-virt'
+app-vm
+kvm
+```
+
+---
+
+## 7. Деплой приложения в VM и проброс порта
+
+### 7.1. Установка Docker в app-vm
 
 ```bash
-ssh app-vm hostname        # → app-vm
+ssh app-vm 'sudo apt update && sudo apt install -y docker.io docker-compose-v2'
 ```
 
-### 7.2. Установка Docker в app-vm
+### 7.2. Копирование файлов и запуск
 
-```bash
-ssh app-vm 'sudo apt-get update && sudo apt-get install -y docker.io docker-compose-v2'
-ssh app-vm 'sudo docker version && sudo docker compose version'
-```
-
-### 7.3. Копирование файлов и запуск
-
-Из каталога `lab2/` репозитория на маке (`cd git-lab/lab2`):
+На маке, из каталога `lab2/`:
 
 ```bash
 ssh app-vm 'mkdir -p ~/app'
-scp -r compose.yaml backend frontend app-vm:~/app/
-ssh app-vm 'cd ~/app && sudo docker compose up -d --build'
-ssh app-vm 'cd ~/app && sudo docker compose ps'
+scp -r backend frontend compose.yaml app-vm:~/app/
+ssh app-vm 'cd ~/app && sudo docker compose up -d --build && sudo docker compose ps'
 ```
 
-Образы собираются прямо в app-vm под arm64 (aarch64).
-
-Вывод:
+Образы собираются прямо в app-vm под arm64. Каталог проекта в VM называется `app`, поэтому контейнеры называются `app-backend-1` и `app-frontend-1`.
 
 ```
 $ ssh app-vm 'cd ~/app && sudo docker compose ps'
-<вставить вывод>
+NAME             IMAGE                 COMMAND                  SERVICE    CREATED        STATUS        PORTS
+app-backend-1    lab-backend:latest    "gunicorn --bind 0.0…"   backend    13 hours ago   Up 13 hours   5000/tcp
+app-frontend-1   lab-frontend:latest   "/docker-entrypoint.…"   frontend   13 hours ago   Up 13 hours   0.0.0.0:8080->80/tcp, [::]:8080->80/tcp
+
+$ ssh app-vm 'curl -s localhost:8080/api/info'
+{"container":"643440e21b61","message":"Привет от backend-сервиса на Flask!","time":"2026-10-20T08:20:43.782974+00:00"}
 ```
 
-**Скриншот:** `docker compose ps` в VM
+### 7.3. Проброс порта на ноутбук
 
-![docker compose ps](screenshots/05-docker-compose-ps.png)
-
-### 7.4. Проброс порта на ноутбук
+Команда запускается **на маке** (не внутри kvmhost):
 
 ```bash
 ssh -N -L 8080:localhost:8080 app-vm
 ```
 
-Команда держит туннель открытым, пока запущена. Порт `8080` на маке пробрасывается через kvmhost на `localhost:8080` внутри app-vm, где его слушает контейнер frontend.
+Туннель открыт, пока команда работает. Порт `8080` на маке через kvmhost пробрасывается на `localhost:8080` внутри app-vm, где его слушает контейнер frontend.
 
-> Перед запуском туннеля остановите локальный стек (`docker compose down`), иначе порт 8080 на маке будет занят.
+> Перед запуском туннеля нужно остановить локальный стек (`docker compose down`), иначе порт 8080 на маке будет занят.
 
 ---
 
@@ -429,7 +366,7 @@ ssh -N -L 8080:localhost:8080 app-vm
 
 **http://localhost:8080**
 
-Открывается в браузере на маке, пока работает туннель из п. 7.4.
+Открывается в браузере на маке, пока работает туннель из п. 7.3.
 
 ---
 
@@ -437,62 +374,13 @@ ssh -N -L 8080:localhost:8080 app-vm
 
 1. **Страница в браузере.** На http://localhost:8080 видны сообщение, имя контейнера, время и исходный JSON из `/api/info`. Статус «Бэкенд доступен, данные получены» подтверждает, что `fetch` прошёл через nginx до Flask.
 
-2. **curl через туннель:**
+2. **curl с ноутбука через туннель:**
 
-   ```bash
-   curl http://localhost:8080/api/info
-   curl http://localhost:8080/api/health
-   ```
+```
+   $ curl localhost:8080/api/info
+   {"container":"643440e21b61","message":"Привет от backend-сервиса на Flask!","time":"2026-10-20T08:22:16.082872+00:00"}
+```
 
-   ```
-   <вставить вывод, например:
-   {"container":"3f2a9c1b7d4e","message":"Привет от backend-сервиса на Flask!","time":"..."}
-   {"status":"ok"}>
-   ```
+3. **Запрос дошёл именно до контейнера в app-vm.** Поле `container` (`643440e21b61`) с мака совпадает с ответом, полученным внутри app-vm в п. 7.2. Значит, запрос прошёл всю цепочку: ноутбук → SSH-туннель → kvmhost → app-vm → frontend (nginx) → backend (Flask).
 
-3. **Поле `container` совпадает с контейнером бэкенда.** Hostname контейнера Docker равен первым 12 символам его ID:
-
-   ```bash
-   ssh app-vm 'cd ~/app && sudo docker compose ps'
-   ssh app-vm 'cd ~/app && sudo docker compose ps -q backend | cut -c1-12'
-   ssh app-vm 'cd ~/app && sudo docker compose exec backend hostname'
-   ```
-
-   ```
-   <вставить вывод: значение совпадает с полем "container" из /api/info>
-   ```
-
-   Ответ на `/api/info` сформировал именно контейнер `backend`, а nginx лишь проксировал запрос по внутренней сети compose.
-
-4. **Бэкенд не опубликован наружу.** В `docker compose ps` у `backend` в колонке `PORTS` указано только `5000/tcp`, без `0.0.0.0:...`. Запрос к нему возможен только из сети compose:
-
-   ```bash
-   ssh app-vm 'curl -s -m 2 http://localhost:5000/api/health || echo "недоступен с хоста VM"'
-   ```
-
----
-
-## 10. Скриншоты
-
-Скриншоты лежат в каталоге `lab2/screenshots/` (ссылки ниже относительные, от `lab2/README.md`):
-
-| № | Что показано                                     | Файл                                       |
-|---|--------------------------------------------------|--------------------------------------------|
-| 1 | `kvm-ok` внутри kvmhost                          | `screenshots/01-kvm-ok.png`                |
-| 2 | `virsh list --all` (app-vm в состоянии running)  | `screenshots/02-virsh-list.png`            |
-| 3 | `virsh dumpxml app-vm \| grep "domain type"` → `kvm` | `screenshots/03-domain-type-kvm.png`   |
-| 4 | `systemd-detect-virt` внутри app-vm → `kvm`      | `screenshots/04-systemd-detect-virt.png`   |
-| 5 | `sudo docker compose ps` в app-vm                | `screenshots/05-docker-compose-ps.png`     |
-| 6 | Страница http://localhost:8080 в браузере на маке | `screenshots/06-browser.png`              |
-
-![kvm-ok](screenshots/01-kvm-ok.png)
-
-![virsh list](screenshots/02-virsh-list.png)
-
-![domain type kvm](screenshots/03-domain-type-kvm.png)
-
-![systemd-detect-virt](screenshots/04-systemd-detect-virt.png)
-
-![docker compose ps в VM](screenshots/05-docker-compose-ps.png)
-
-![страница в браузере](screenshots/06-browser.png)
+4. **Бэкенд не опубликован наружу.** В `docker compose ps` у `backend` в колонке `PORTS` указано только `5000/tcp`, без `0.0.0.0:...`, то есть к нему можно обратиться только из сети compose через nginx.
